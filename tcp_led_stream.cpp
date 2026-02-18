@@ -12,7 +12,7 @@ namespace tcp_led_stream {
 static const char *const TAG = "tcp_led_stream";
 // Frame format:
 //  0-3  Magic bytes 'LEDS'
-//  4    Version (0x01)
+//  4    Version (0x01 legacy, 0x02 with ACK pacing)
 //  5-8  Pixel count (uint32_t big endian)
 //  9    Pixel format enum
 // 10-?  Pixel data (count * (3|4) bytes)
@@ -28,6 +28,7 @@ void TCPLedStreamComponent::setup() {
 
   this->outputs_.clear();
   this->total_led_count_ = 0;
+  this->largest_led_count_ = 0;
   for (auto *light_state : this->lights_) {
     if (light_state == nullptr) {
       ESP_LOGE(TAG, "Invalid light configured");
@@ -40,8 +41,12 @@ void TCPLedStreamComponent::setup() {
       this->mark_failed();
       return;
     }
+    const uint32_t strip_size = static_cast<uint32_t>(addr->size());
     this->outputs_.push_back(addr);
-    this->total_led_count_ += addr->size();
+    this->total_led_count_ += strip_size;
+    if (strip_size > this->largest_led_count_) {
+      this->largest_led_count_ = strip_size;
+    }
   }
 
   this->server_ = socket::socket_ip_loop_monitored(SOCK_STREAM, 0);
@@ -177,8 +182,9 @@ bool TCPLedStreamComponent::read_frame_() {
         return false;
       }
 
-      if (this->header_buffer_[4] != 0x01) {
-        ESP_LOGW(TAG, "Unsupported protocol version %u", this->header_buffer_[4]);
+      this->current_frame_version_ = this->header_buffer_[4];
+      if (this->current_frame_version_ != 0x01 && this->current_frame_version_ != 0x02) {
+        ESP_LOGW(TAG, "Unsupported protocol version %u", this->current_frame_version_);
         this->reset_receive_state_();
         return false;
       }
@@ -239,8 +245,9 @@ bool TCPLedStreamComponent::read_frame_() {
       uint32_t now = App.get_loop_component_start_time();
       uint32_t window_ms = this->frame_completion_interval_ms_;
       if (this->completion_mode_ == "estimate") {
-        if (this->total_led_count_ > 0) {
-          uint32_t est = (uint64_t) this->total_led_count_ * this->show_time_per_led_us_ / 1000ULL + 2;
+        if (this->largest_led_count_ > 0) {
+          uint32_t est =
+              (uint64_t) this->largest_led_count_ * this->show_time_per_led_us_ / 1000ULL + this->safety_margin_ms_;
           window_ms = est > 1 ? est : 1;
         }
       }
@@ -251,6 +258,9 @@ bool TCPLedStreamComponent::read_frame_() {
       this->frame_in_progress_ = true;
       this->last_frame_time_ = now;
       this->apply_pixels_(this->rx_buffer_.data(), count);
+      if (this->current_frame_version_ == 0x02) {
+        this->schedule_ack_(now);
+      }
       this->frame_count_++;
       this->bytes_received_ += (uint32_t) (10 + this->rx_buffer_.size());
       this->last_activity_ = now;
@@ -273,6 +283,7 @@ void TCPLedStreamComponent::loop() {
       this->client_->setblocking(false);
       this->last_activity_ = App.get_loop_component_start_time();
       this->reset_receive_state_();  // Reset buffering state for new connection
+      this->reset_ack_state_();
       std::array<char, socket::SOCKADDR_STR_LEN> peer{};
       if (this->client_->getpeername_to(peer) > 0) {
         ESP_LOGI(TAG, "Client connected %s", peer.data());
@@ -288,7 +299,13 @@ void TCPLedStreamComponent::loop() {
     }
   }
   if (this->client_) {
-    if (!this->read_frame_()) {
+    bool connection_ok = true;
+    if (this->ack_pending_) {
+      connection_ok = this->maybe_send_ack_();
+    } else {
+      connection_ok = this->read_frame_();
+    }
+    if (!connection_ok) {
       // Connection error or protocol violation - close connection
       ESP_LOGI(TAG, "Closing connection due to error");
       this->client_->close();
@@ -296,6 +313,7 @@ void TCPLedStreamComponent::loop() {
       this->disconnects_++;
       this->frame_in_progress_ = false;
       this->reset_receive_state_();
+      this->reset_ack_state_();
 #ifdef USE_BINARY_SENSOR
       if (this->client_connected_binary_sensor_ != nullptr) {
         this->client_connected_binary_sensor_->publish_state(false);
@@ -308,6 +326,7 @@ void TCPLedStreamComponent::loop() {
       this->disconnects_++;
       this->frame_in_progress_ = false;
       this->reset_receive_state_();
+      this->reset_ack_state_();
 #ifdef USE_BINARY_SENSOR
       if (this->client_connected_binary_sensor_ != nullptr) {
         this->client_connected_binary_sensor_->publish_state(false);
@@ -319,8 +338,9 @@ void TCPLedStreamComponent::loop() {
   // Heuristic: mark frame complete when window elapsed
   uint32_t window_ms2 = this->frame_completion_interval_ms_;
   if (this->completion_mode_ == "estimate") {
-    if (this->total_led_count_ > 0) {
-      uint32_t est = (uint64_t) this->total_led_count_ * this->show_time_per_led_us_ / 1000ULL + 2;
+    if (this->largest_led_count_ > 0) {
+      uint32_t est =
+          (uint64_t) this->largest_led_count_ * this->show_time_per_led_us_ / 1000ULL + this->safety_margin_ms_;
       window_ms2 = est > 1 ? est : 1;
     }
   }
@@ -366,6 +386,8 @@ void TCPLedStreamComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "  Completion mode: %s", this->completion_mode_.c_str());
   ESP_LOGCONFIG(TAG, "  Frame completion interval (ms): %u", this->frame_completion_interval_ms_);
   ESP_LOGCONFIG(TAG, "  Show time per LED (us): %u", this->show_time_per_led_us_);
+  ESP_LOGCONFIG(TAG, "  Safety margin (ms): %u", this->safety_margin_ms_);
+  ESP_LOGCONFIG(TAG, "  Largest strip LEDs: %u", this->largest_led_count_);
 }
 
 void TCPLedStreamComponent::reset_receive_state_() {
@@ -373,6 +395,42 @@ void TCPLedStreamComponent::reset_receive_state_() {
   this->header_bytes_received_ = 0;
   this->payload_bytes_received_ = 0;
   this->expected_payload_size_ = 0;
+  this->current_frame_version_ = 0x01;
+}
+
+void TCPLedStreamComponent::schedule_ack_(uint32_t now) {
+  uint64_t tx_us = (uint64_t) this->largest_led_count_ * this->show_time_per_led_us_;
+  uint32_t tx_ms = (uint32_t) ((tx_us + 999ULL) / 1000ULL);  // round up to next millisecond
+  this->ack_due_time_ms_ = now + tx_ms + this->safety_margin_ms_;
+  this->ack_pending_ = true;
+}
+
+bool TCPLedStreamComponent::maybe_send_ack_() {
+  if (!this->ack_pending_ || this->client_ == nullptr) {
+    return true;
+  }
+  uint32_t now = App.get_loop_component_start_time();
+  if ((int32_t) (now - this->ack_due_time_ms_) < 0) {
+    return true;
+  }
+
+  const uint8_t ack = ACK_BYTE_;
+  ssize_t written = this->client_->write(&ack, sizeof(ack));
+  if (written == (ssize_t) sizeof(ack)) {
+    this->ack_pending_ = false;
+    return true;
+  }
+  if (written == -1) {
+    return true;  // socket not ready yet; retry next loop
+  }
+
+  ESP_LOGW(TAG, "Client disconnected before ACK could be sent");
+  return false;
+}
+
+void TCPLedStreamComponent::reset_ack_state_() {
+  this->ack_pending_ = false;
+  this->ack_due_time_ms_ = 0;
 }
 
 }  // namespace tcp_led_stream

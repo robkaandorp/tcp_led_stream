@@ -51,6 +51,7 @@ class TCPLedStreamComponent : public Component {
   }
   void set_completion_mode(const std::string &m) { this->completion_mode_ = m; }
   void set_show_time_per_led_us(uint32_t v) { this->show_time_per_led_us_ = v; }
+  void set_safety_margin_ms(uint32_t v) { this->safety_margin_ms_ = v; }
 
   float get_setup_priority() const override { return setup_priority::AFTER_WIFI; }
   void setup() override;
@@ -62,10 +63,14 @@ class TCPLedStreamComponent : public Component {
   bool apply_pixels_(const uint8_t *data, uint32_t count);
   void publish_stats_();
   void reset_receive_state_();
+  void schedule_ack_(uint32_t now);
+  bool maybe_send_ack_();
+  void reset_ack_state_();
 
   std::vector<light::AddressableLightState *> lights_;
   std::vector<light::AddressableLight *> outputs_;
   uint32_t total_led_count_{0};
+  uint32_t largest_led_count_{0};
   uint16_t port_{7777};
   PixelFormat format_{RGB};
   uint32_t timeout_ms_{5000};
@@ -83,6 +88,10 @@ class TCPLedStreamComponent : public Component {
   size_t header_bytes_received_{0};
   uint32_t expected_payload_size_{0};
   size_t payload_bytes_received_{0};
+  uint8_t current_frame_version_{0x01};
+  bool ack_pending_{false};
+  uint32_t ack_due_time_ms_{0};
+  static constexpr uint8_t ACK_BYTE_{0x06};
 
   // Stats
   uint32_t frame_count_{0};
@@ -95,6 +104,7 @@ class TCPLedStreamComponent : public Component {
   bool frame_in_progress_{false};
   std::string completion_mode_{"heuristic"};
   uint32_t show_time_per_led_us_{30};  // microseconds per LED (estimate mode)
+  uint32_t safety_margin_ms_{2};       // extra margin for estimate mode and ACK pacing
 
   // Sensors
 #ifdef USE_SENSOR

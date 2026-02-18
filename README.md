@@ -4,12 +4,22 @@ Stream full frames of addressable LED pixel data to ESPHome over a raw TCP conne
 
 Frame format (single write per frame):
 - Bytes 0-3: ASCII `LEDS`
-- Byte 4: Protocol version (0x01)
+- Byte 4: Protocol version (`0x01` legacy, `0x02` enables ACK pacing)
 - Bytes 5-8: Pixel count (big-endian uint32)
 - Byte 9: Pixel format enum (0=RGB,1=RGBW,2=GRB,3=GRBW,4=BGR)
 - Bytes 10..: Pixel data tightly packed (count * bytes_per_pixel)
 
 Bytes per pixel: 3 for RGB/GRB/BGR, 4 for RGBW/GRBW.
+
+## ACK pacing (protocol v2)
+
+When version `0x02` is used, the server sends a single-byte ACK (`0x06`) after each frame.
+The ACK is intentionally delayed to track WS2812 output timing:
+
+- delay ≈ `largest_strip_led_count * show_time_per_led_us` (converted to ms, rounded up)
+- plus configurable `safety_margin_ms` (default 2ms)
+
+This lets clients wait for ACK before sending the next frame and avoid overrunning LED refresh.
 
 Example YAML:
 ```yaml
@@ -30,6 +40,7 @@ tcp_led_stream:
   port: 7777
   pixel_format: RGB
   timeout: 5000
+  safety_margin_ms: 2
 ```
 
 Send a frame from Python:
@@ -38,9 +49,12 @@ import socket, struct
 HOST='esp.local'; PORT=7777
 count=1200
 pixels=bytearray([0,0,0]*count)  # fill with your RGB data
-hdr=b'LEDS'+bytes([1])+struct.pack('>I', count)+bytes([0])
+hdr=b'LEDS'+bytes([2])+struct.pack('>I', count)+bytes([0])  # version 2 enables ACK
 s=socket.create_connection((HOST,PORT))
 s.sendall(hdr+pixels)
+ack=s.recv(1)
+if ack != b'\x06':
+    raise RuntimeError(f"bad ACK: {ack!r}")
 ```
 
 Future ideas: optional CRC, chunked streaming, gzip, authentication, multi-client broadcast.
@@ -69,7 +83,8 @@ tcp_led_stream:
   timeout: 5000
   frame_completion_interval: 15   # ms window to consider frame rendering "busy"
   completion_mode: heuristic       # or 'estimate'
-  show_time_per_led_us: 30         # only used in estimate mode (microseconds per LED)
+  show_time_per_led_us: 30         # estimate mode + protocol v2 ACK pacing delay
+  safety_margin_ms: 2              # added to estimate timing and v2 ACK delay
   frame_rate:
     name: LED Stream FPS
   bytes_received:
@@ -96,6 +111,8 @@ Sensors:
 
 `completion_mode`:
 - `heuristic` (default): Uses the fixed `frame_completion_interval`.
-- `estimate`: Dynamically estimates completion time from LED count * `show_time_per_led_us` + small overhead (2ms). This can better reflect long strips where refresh time scales with length.
+- `estimate`: Dynamically estimates completion time from the longest configured strip (`max(light_ids[].num_leds)`) * `show_time_per_led_us` + `safety_margin_ms`. This better matches per-strip refresh timing.
 
-`show_time_per_led_us` is the assumed microseconds each LED requires for transfer + latch (e.g. WS2812 ~30 µs/LED including reset overhead averaged). Adjust based on your physical strip and driver method. A too-small value underestimates overlap; a too-large value may over-count overlaps.
+`show_time_per_led_us` is the assumed microseconds each LED requires for transfer + latch (e.g. WS2812 ~30 µs/LED including reset overhead averaged). It is used for estimate-mode overlap timing and protocol v2 ACK delay calculation.
+
+`safety_margin_ms` adds fixed extra delay on top of that estimate for both estimate-mode overlap timing and protocol v2 ACK pacing. A too-small margin can under-estimate completion; a too-large margin reduces maximum frame rate.

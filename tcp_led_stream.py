@@ -58,6 +58,7 @@ CONF_FRAME_COMPLETION_INTERVAL = "frame_completion_interval"
 CONF_CLIENT_CONNECTED = "client_connected"
 CONF_COMPLETION_MODE = "completion_mode"
 CONF_SHOW_TIME_PER_LED_US = "show_time_per_led_us"
+CONF_SAFETY_MARGIN_MS = "safety_margin_ms"
 
 COMPLETION_MODES = ["heuristic", "estimate"]
 
@@ -81,6 +82,7 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_SHOW_TIME_PER_LED_US, default=30): cv.int_range(
             min=1, max=200
         ),
+        cv.Optional(CONF_SAFETY_MARGIN_MS, default=2): cv.int_range(min=0, max=200),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -125,6 +127,7 @@ async def to_code(config):
     cg.add(var.set_frame_completion_interval(config[CONF_FRAME_COMPLETION_INTERVAL]))
     cg.add(var.set_completion_mode(config[CONF_COMPLETION_MODE]))
     cg.add(var.set_show_time_per_led_us(config[CONF_SHOW_TIME_PER_LED_US]))
+    cg.add(var.set_safety_margin_ms(config[CONF_SAFETY_MARGIN_MS]))
 
     if HAS_SENSOR:
         if CONF_FRAME_RATE in config:
